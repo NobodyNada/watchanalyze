@@ -184,4 +184,5 @@ let csv = watches.map {
         return "\"\(escaped)\""
     }.joined(separator: ",")
 }
-try csv.joined(separator: "\n").write(to: URL(fileURLWithPath: "watchanalyze.csv"), atomically: true, encoding: .utf8)
+let header = "line_number,timestamp,creator,pattern,total,tp,fp"
+try ([header] + csv).joined(separator: "\n").write(to: URL(fileURLWithPath: "watchanalyze.csv"), atomically: true, encoding: .utf8)
