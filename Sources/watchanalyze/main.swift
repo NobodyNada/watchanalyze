@@ -53,13 +53,13 @@ struct Watch {
             
             // Get rid of *, but not \*.
             .replacingOccurrences(of: "\(unescaped)\\*", with: "{0,100}", options: .regularExpression)
-        
+            
             // Replace unbounded quantifiers {n,} with bounded ones {n,1000}.
             .replacingOccurrences(of: ",}", with: ",100}")
         
         self.patternRegex = try NSRegularExpression(
-                pattern: cleanedPattern,
-                options: [.caseInsensitive, .useUnicodeWordBoundaries]
+            pattern: cleanedPattern,
+            options: [.caseInsensitive, .useUnicodeWordBoundaries]
         )
     }
     
@@ -84,8 +84,9 @@ print("Loading watchlist...")
 var watches = try Array(
     String(contentsOf: URL(fileURLWithPath: "watched_keywords.txt"))
         .components(separatedBy: .newlines).lazy
-        .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
         .enumerated()
+        .map { ($0.0 + 1, $0.1) }   // line numbers start at 1
+        .filter { !$0.1.trimmingCharacters(in: .whitespaces).isEmpty }
         .compactMap { (lineNumber: Int, line: String) -> Watch? in
             switch Result(catching: { try Watch(line, lineNumber: lineNumber) }) {
             case .success(.some(let watch)):
@@ -107,66 +108,93 @@ mysqlDateFormatter.timeZone = TimeZone(abbreviation: "UTC")!
 // Pull posts from the database and dispatch them onto worker threads.
 let queue = DispatchQueue(label: "com.nobodynada.watchanalyze.regex", attributes: .concurrent, autoreleaseFrequency: .workItem)
 
+
+let postsPerPage = 256
 // To keep memory usage down, don't pull posts faster than we can process them.
-let maxInFlightPosts = 256
-let sema = DispatchSemaphore(value: maxInFlightPosts)
+let maxInFlightPages = 2 * ProcessInfo.processInfo.activeProcessorCount
+let sema = DispatchSemaphore(value: maxInFlightPages)
 
 print("Scanning posts...")
-var postsScanned = 0
-let query = """
+var pagesScanned = 0
+var lastID = 0
+
+while true {
+    let query = """
 SELECT p_posts.id, p_posts.body, p_posts.created_at, p_posts.is_tp, p_posts.is_naa, p_posts.is_fp
     FROM p_posts
         JOIN p_posts_reasons ON p_posts.id = p_posts_reasons.post_id
-    WHERE  p_posts_reasons.reason_id = 127
-        OR p_posts_reasons.reason_id = 129
-    GROUP BY p_posts.id;
+    WHERE (p_posts_reasons.reason_id = 127
+            OR p_posts_reasons.reason_id = 129)
+        AND p_posts.id > \(lastID)
+    GROUP BY p_posts.id
+    ORDER BY p_posts.id
+    LIMIT \(postsPerPage);
 """
-
-try database.simpleQuery(query) { post in
-    print("Scanned \(postsScanned) posts.")
-    postsScanned += 1
+    
+    let pageNumber = pagesScanned
+    print("Fetching \(pageNumber)")
+    
+    let page = try database.simpleQuery(query).wait()
+    if page.isEmpty { break }   // we're done
+    
+    guard let id = page.last!.column("id")?.int else {
+        fatalError("post has no ID")
+    }
+    lastID = id
+    
+    pagesScanned += 1
     
     sema.wait()
     queue.async {
         defer { sema.signal() }
         
-        guard let id = post.column("id")?.int else {
-            print("warning: post has no ID")
-            return
+        print("\t\t\tProcessing \(pageNumber).")
+        let startTime = Date()
+        
+        for post in page {
+            guard let id = post.column("id")?.int else {
+                print("warning: post has no ID, skipping")
+                continue
+            }
+            
+            guard let body = post.column("body")?.string else {
+                print("warning: post \(id) has no body; skipping")
+                continue
+            }
+            
+            guard let creationString = post.column("created_at")?.string,
+                  let creation = mysqlDateFormatter.date(from: creationString) else {
+                print("warning: post \(id) has no date; skipping")
+                continue
+            }
+            
+            guard let isTP = post.column("is_tp")?.int.map({ $0 != 0 }),
+                  let isNAA = post.column("is_naa")?.int.map({ $0 != 0 }),
+                  let isFP = post.column("is_fp")?.int.map({ $0 != 0 })
+                    .map({ $0 || isNAA })   // Count NAAs as FPs
+            else {
+                print("warning: post \(id) is has invalid feedback; skipping")
+                continue
+            }
+            
+            for watch in watches {
+                print("Processing watch \(watch.lineNumber)")
+                if watch.timestamp < creation && watch.matches(body) {
+                    watch._hitsTotal.wrappingIncrement(ordering: .relaxed)
+                    if isTP { watch._hitsTP.wrappingIncrement(ordering: .relaxed) }
+                    if isFP { watch._hitsFP.wrappingIncrement(ordering: .relaxed) }
+                }
+            }
         }
         
-        guard let body = post.column("body")?.string else {
-            print("warning: post \(id) has no body")
-            return
-        }
-        
-        guard let creationString = post.column("created_at")?.string,
-              let creation = mysqlDateFormatter.date(from: creationString) else {
-            print("warning: post \(id) has no date")
-            return
-        }
-        
-        guard let isTP = post.column("is_tp")?.int.map({ $0 != 0 }),
-              let isNAA = post.column("is_naa")?.int.map({ $0 != 0 }),
-              let isFP = post.column("is_fp")?.int.map({ $0 != 0 })
-                .map({ $0 || isNAA })   // Count NAAs as FPs
-        else {
-            print("warning: post \(id) is has invalid feedback")
-            return
-        }
-        
-        for watch in watches where watch.timestamp < creation && watch.matches(body) {
-            watch._hitsTotal.wrappingIncrement(ordering: .relaxed)
-            if isTP { watch._hitsTP.wrappingIncrement(ordering: .relaxed) }
-            if isFP { watch._hitsFP.wrappingIncrement(ordering: .relaxed) }
-        }
+        let duration = Date().timeIntervalSince(startTime)
+        print("\t\t\t\t\t\t\tProcessed page \(pageNumber) in \(round(duration*10)/10)s.")
     }
-}.wait()
-
+}
 // Wait for all inflight requests to complete.
-for _ in 0..<maxInFlightPosts { sema.wait() }
+for _ in 0..<maxInFlightPages { sema.wait() }
 atomicMemoryFence(ordering: .acquiring)
-print("Scanned \(postsScanned) posts. Saving...")
+print("Scanned \(pagesScanned) pages. Saving...")
 
 // write to CSV
 
