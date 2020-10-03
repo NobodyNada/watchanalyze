@@ -178,7 +178,6 @@ SELECT p_posts.id, p_posts.body, p_posts.created_at, p_posts.is_tp, p_posts.is_n
             }
             
             for watch in watches {
-                print("Processing watch \(watch.lineNumber)")
                 if watch.timestamp < creation && watch.matches(body) {
                     watch._hitsTotal.wrappingIncrement(ordering: .relaxed)
                     if isTP { watch._hitsTP.wrappingIncrement(ordering: .relaxed) }
