@@ -191,7 +191,6 @@ SELECT p_posts.id, p_posts.body, p_posts.created_at, p_posts.is_tp, p_posts.is_n
 }
 // Wait for all inflight requests to complete.
 for _ in 0..<maxInFlightPages { sema.wait() }
-atomicMemoryFence(ordering: .acquiring)
 print("Scanned \(pagesScanned) pages. Saving...")
 
 // write to CSV
