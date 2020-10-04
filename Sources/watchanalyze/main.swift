@@ -58,8 +58,7 @@ struct Watch {
             .replacingOccurrences(of: ",}", with: ",100}")
         
         self.patternRegex = try NSRegularExpression(
-            pattern: cleanedPattern,
-            options: [.caseInsensitive, .useUnicodeWordBoundaries]
+            pattern: "(?is)(?:^|\\b|(?w:\\b))(?:\(cleanedPattern))(?:\\b|(?w:\\b)|$)"
         )
     }
     
